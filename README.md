@@ -1,3 +1,5 @@
+**English** | [中文](README.zh-CN.md)
+
 # approval-judge-bridge
 
 An OpenAI-compatible endpoint that answers an agent's **approval-guardian call** with a judged
@@ -118,7 +120,7 @@ Environment:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `JUDGE_BACKEND` | `typesafe` | `typesafe`, `openai`, `rules` |
+| `JUDGE_BACKEND` | `typesafe` | `typesafe`, `yajev`, `openai`, `rules` |
 | `JUDGE_HOST` / `JUDGE_PORT` | `127.0.0.1` / `3999` | bind address |
 | `JUDGE_AUTO_ACCEPT` / `JUDGE_MIN_MARGIN` | `0.65` / `0.30` | thresholds for probability-carrying judges |
 | `JUDGE_LOG` | `~/.approval-judge-bridge/decisions.jsonl` | one JSON record per decision |
