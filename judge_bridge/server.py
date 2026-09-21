@@ -17,7 +17,7 @@ from pathlib import Path
 from .backends import build_backend
 from .config import Config
 from .decision import Decision, escalate
-from .prompts import extract_command, extract_flagged_as, extract_policy
+from .prompts import envelope_problem, extract_command, extract_flagged_as, extract_policy
 
 MAX_LOG_BYTES = 16 * 1024 * 1024
 
@@ -42,21 +42,38 @@ class JudgeService:
 
     def judge_request(self, body: dict) -> tuple[str, Decision, dict]:
         """(model, decision, log record) for one guardian call."""
-        messages = body.get("messages") or []
-        system_text = "\n".join(m.get("content") or "" for m in messages if m.get("role") == "system")
-        user_text = "\n".join(m.get("content") or "" for m in messages if m.get("role") == "user")
-        command = extract_command(user_text)
-        flagged_as = extract_flagged_as(user_text)
-        policy = extract_policy(system_text)
         started = time.monotonic()
+        model = self.backend.name
+        command = flagged_as = policy = ""
         try:
-            decision = self.backend.judge(command, flagged_as, policy)
-        except Exception as exc:  # a backend bug must not open the gate
-            decision = escalate(f"{type(exc).__name__}")
+            if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
+                raise ValueError("bad_request_shape")
+            messages = body["messages"]
+            for message in messages:
+                if (not isinstance(message, dict)
+                        or (message.get("content") is not None and not isinstance(message["content"], str))
+                        or (message.get("role") is not None and not isinstance(message["role"], str))):
+                    raise ValueError("bad_request_shape")
+            model = str(body.get("model") or self.backend.name)
+            system_text = "\n".join(m.get("content") or "" for m in messages if m.get("role") == "system")
+            user_text = "\n".join(m.get("content") or "" for m in messages if m.get("role") == "user")
+            problem = envelope_problem(user_text)
+            if problem:
+                raise ValueError(problem)
+            command = extract_command(user_text)
+            flagged_as = extract_flagged_as(user_text)
+            policy = extract_policy(system_text)
+        except Exception as exc:
+            decision = escalate(str(exc) if isinstance(exc, ValueError) else "bad_request_shape")
+        else:
+            try:
+                decision = self.backend.judge(command, flagged_as, policy)
+            except Exception as exc:  # a backend bug must not open the gate
+                decision = escalate(f"{type(exc).__name__}")
         record = {
             "ts": time.time(),
             "backend": self.backend.name,
-            "model": body.get("model") or self.backend.name,
+            "model": model,
             "flagged_as": flagged_as,
             "command": command[:400],
             "verdict": decision.verdict,
@@ -68,7 +85,7 @@ class JudgeService:
             "reason": decision.reason,
             "latency_s": round(time.monotonic() - started, 3),
         }
-        return str(body.get("model") or self.backend.name), decision, record
+        return model, decision, record
 
 
 class Handler(BaseHTTPRequestHandler):

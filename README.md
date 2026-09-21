@@ -133,6 +133,21 @@ Environment:
 
 Keys are read from the environment or the env file and are **never** logged.
 
+## Input requirements
+
+The bridge judges one complete, unambiguous command and nothing less:
+
+- The user message must contain **exactly one** `<command>…</command>` pair. Host instruction
+  text around it is fine — the reference host puts its description line before the block and its
+  one-word request after the closing delimiter — but a second `<command>` or `</command>`
+  (which is what a command *containing* a delimiter looks like) escalates, because the judged
+  text would otherwise be a prefix of what actually runs.
+- A command longer than `MAX_COMMAND_CHARS` (6000 characters) escalates. It is never shortened
+  silently and judged from its benign beginning.
+- Operator policy is still read from the system message only. In the `yajev` backend, where the
+  wire format has a single context field, the policy block is marked inside that field instead of
+  being a separate channel.
+
 ## Calibration
 
 Thresholds are a policy decision, so make it on data. Every decision is logged with the winning
@@ -174,6 +189,13 @@ It exits non-zero if any benign command fails to approve or any dangerous one ap
 | Timeout / connection error / HTTP error | `ESCALATE` |
 | HTTP 429 from the classify endpoint | one retry after 0.4s, then `ESCALATE` |
 | Malformed or missing answer envelope | `ESCALATE` |
+| Distribution missing, partial, or holding anything that is not a finite probability in [0, 1] | `ESCALATE` |
+| Winning class is not the argmax of the returned distribution | `ESCALATE` |
+| User message lacks a `<command>` block, has more than one, an unclosed one, or delimiters in the wrong order | `ESCALATE` |
+| Command longer than `MAX_COMMAND_CHARS` (6000) — it is never truncated and judged | `ESCALATE` |
+| Answer status is `content_filter` (`openai` backend) | `ESCALATE` (no retry) |
+| Request body is valid JSON of the wrong shape (array, `null`, non-list `messages`, non-string `content`) | `ESCALATE` (HTTP 200, logged `bad_request_shape`) |
+| Thresholds outside [0, 1] or non-finite | the service refuses to start |
 | Winning class disagrees with the returned distribution (classify backend) | `ESCALATE` |
 | Empty or unrecognised answer (after one retry on the `openai` backend) | `ESCALATE` |
 | Malformed HTTP request to the bridge | `ESCALATE` |
@@ -194,12 +216,14 @@ previous provider).
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t . -v     # 41 tests, no network, no dependencies
+python3 -m unittest discover -s tests -t . -v     # 54 tests, no network, no dependencies
 ```
 
-The suite covers the thresholds invariant, every fail-closed path, the retry-with-headroom
-behaviour, prompt extraction (including that operator policy is read from the *system* channel
-only), and the HTTP surface end-to-end over a real socket.
+The suite covers the thresholds invariant, every fail-closed path (invalid, partial and
+contradictory distributions; malformed request shapes; ambiguous command envelopes;
+truncated or verbose model answers), the retry-with-headroom behaviour, prompt extraction
+(including that operator policy is read from the *system* channel only), and the HTTP
+surface end-to-end over a real socket.
 
 ## What this is not
 

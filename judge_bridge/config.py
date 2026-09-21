@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,13 @@ def _float(name: str, default: float) -> float:
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _threshold(name: str, default: float) -> float:
+    value = float(os.environ.get(name, default))
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(f"{name} must be finite and within [0, 1]")
+    return value
 
 
 def _int(name: str, default: int) -> int:
@@ -64,8 +72,8 @@ class Config:
             port=_int("JUDGE_PORT", 3999),
             env_file=env_file,
             log_path=Path(os.environ.get("JUDGE_LOG", str(DEFAULT_LOG))),
-            auto_accept=_float("JUDGE_AUTO_ACCEPT", 0.65),
-            min_margin=_float("JUDGE_MIN_MARGIN", 0.30),
+            auto_accept=_threshold("JUDGE_AUTO_ACCEPT", 0.65),
+            min_margin=_threshold("JUDGE_MIN_MARGIN", 0.30),
             timeout=_float("JUDGE_UPSTREAM_TIMEOUT", 12.0),
             typesafe_api_url=os.environ.get("TYPESAFE_API_URL", "https://api.typesafe.ai/v1/systemone"),
             typesafe_model=os.environ.get("TYPESAFE_MODEL", "jev-latest"),
@@ -85,6 +93,9 @@ class Config:
     def backend_options(self) -> dict:
         """Options for the selected backend — validated here so a misconfigured unit fails at
         startup, loudly, instead of escalating every command."""
+        for name, value in (("JUDGE_AUTO_ACCEPT", self.auto_accept), ("JUDGE_MIN_MARGIN", self.min_margin)):
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be finite and within [0, 1]")
         if self.backend == "typesafe":
             return {"api_url": self.typesafe_api_url, "model": self.typesafe_model, "api_key": self.typesafe_api_key,
                     "auto_accept": self.auto_accept, "min_margin": self.min_margin, "timeout": self.timeout}

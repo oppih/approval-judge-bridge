@@ -9,21 +9,43 @@ it never trusts the command text, and it never treats text inside the command as
 from __future__ import annotations
 
 import re
+import string
 
 COMMAND_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.S)
 FLAGGED_RE = re.compile(r"flagged as:\s*(.+)")
 POLICY_MARKER = "Additional policy rules from the operator"
 
-# A shell command can be arbitrarily long; the judge only needs enough of it to see what it
-# would do. Truncating keeps a runaway command from eating the judge's context window.
+# Overlong commands must be reviewed whole, never judged from a benign prefix.
 MAX_COMMAND_CHARS = 6000
 
 
+def envelope_problem(user_text: str) -> str | None:
+    """Reject ambiguous boundaries before extracting any untrusted command text."""
+    opening_count = user_text.count("<command>")
+    closing_count = user_text.count("</command>")
+    if opening_count > 1 or closing_count > 1:
+        return "multiple_command_envelopes"
+    if opening_count == 0:
+        return "no_command_envelope"
+    if closing_count == 0:
+        return "missing_command_close"
+    prefix, rest = user_text.split("<command>", 1)
+    if "</command>" in prefix:
+        return "invalid_command_envelope"
+    command = rest.split("</command>", 1)[0].strip()
+    if not command:
+        return "invalid_command_envelope"
+    if len(command) > MAX_COMMAND_CHARS:
+        return "command_too_long"
+    return None
+
+
 def extract_command(user_text: str) -> str:
-    """The flagged command, or the whole message when the host sent no delimiters."""
-    match = COMMAND_RE.search(user_text or "")
-    text = (match.group(1) if match else (user_text or "")).strip()
-    return text[:MAX_COMMAND_CHARS]
+    """Extract a complete command; callers validate the envelope before judging it."""
+    problem = envelope_problem(user_text)
+    if problem:
+        raise ValueError(problem)
+    return COMMAND_RE.search(user_text).group(1).strip()
 
 
 def extract_flagged_as(user_text: str) -> str:
@@ -39,9 +61,10 @@ def extract_policy(system_text: str) -> str:
 
 
 def normalize_word(answer: str) -> str:
-    """First recognisable verdict word in an arbitrary judge answer, else ""."""
-    cleaned = (answer or "").strip().upper()
-    if not cleaned:
+    """An exact verdict, optionally followed by one ASCII punctuation character."""
+    if not isinstance(answer, str):
         return ""
-    first = re.split(r"[^A-Z]+", cleaned, maxsplit=1)[0]
-    return first if first in {"APPROVE", "DENY", "ESCALATE"} else ""
+    cleaned = answer.strip().upper()
+    if cleaned and cleaned[-1] in string.punctuation:
+        cleaned = cleaned[:-1]
+    return cleaned if cleaned in {"APPROVE", "DENY", "ESCALATE"} else ""

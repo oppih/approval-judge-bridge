@@ -8,6 +8,7 @@ Thresholds therefore trade prompts for quiet, never protection.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 VERDICT_BY_CLASS = {"approve": "APPROVE", "deny": "DENY", "escalate": "ESCALATE"}
@@ -40,22 +41,45 @@ def from_classification(
     *,
     auto_accept: float,
     min_margin: float,
+    require_distribution: bool = False,
     confidence: float | None = None,
     usage: dict | None = None,
 ) -> Decision:
     """Map a judged class + probability distribution onto a verdict.
 
-    `probabilities` may be empty (an LLM backend that answers with one word); a recognised
-    class then counts as an auto decision, exactly as the host would read the word itself.
+    Only `None` denotes an intentional bare-word answer. Invalid envelopes fail closed.
     """
     if classification not in VERDICT_BY_CLASS:
         return escalate(f"unknown_class:{classification or 'empty'}")
 
-    probs = {k: float(v) for k, v in (probabilities or {}).items() if isinstance(v, (int, float))}
     verdict = Decision(
         verdict=VERDICT_BY_CLASS[classification], classification=classification,
-        decision="auto", probabilities=probs, confidence=confidence, usage=usage,
+        decision="auto", confidence=confidence, usage=usage,
     )
+
+    def invalid(reason: str) -> Decision:
+        # Preserve the reported winner for the log even when its envelope is untrustworthy.
+        verdict.verdict, verdict.decision, verdict.reason = "ESCALATE", "review", reason
+        return verdict
+
+    probs = {}
+    if probabilities is None:
+        if require_distribution:
+            return invalid("invalid_response")
+    else:
+        if not isinstance(probabilities, dict) or not probabilities:
+            return invalid("invalid_response")
+        for name, value in probabilities.items():
+            if (name not in CLASSES or isinstance(value, bool)
+                    or not isinstance(value, (int, float)) or not 0 <= value <= 1
+                    or not math.isfinite(value)):
+                return invalid("invalid_probabilities")
+            probs[name] = float(value)
+        if set(probs) != set(CLASSES):
+            return invalid("incomplete_distribution")
+        if classification not in probs or probs[classification] != max(probs.values()):
+            return invalid("inconsistent_envelope")
+    verdict.probabilities = probs
     if classification != "approve":
         # Explicit non-approve class: always the human's call.
         verdict.decision = "review"

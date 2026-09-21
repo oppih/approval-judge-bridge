@@ -85,6 +85,14 @@ Environment：
 
 Key 从环境或 env 文件中读取，并且**绝不会**被记录。
 
+## Input requirements（输入要求）
+
+bridge 只判定**一条完整、无歧义的命令**：
+
+- 用户消息中必须**恰好存在一对** `<command>…</command>`。块外的宿主说明文字是允许的——参考宿主的写法就是在块前放描述行、在闭合定界符之后放"只回一个词"的要求——但出现第二个 `<command>` 或 `</command>`（即命令自身**含有**定界符的情形）会直接 escalate：否则被判定的是实际执行命令的一个前缀。
+- 命令超过 `MAX_COMMAND_CHARS`（6000 字符）一律 escalate，绝不静默截断后只看前面那段无害内容。
+- operator policy 仍然只从 system 消息读取；在 `yajev` 后端这种线格式只有一个 context 字段时，策略块在该字段内部被显式标注，而不是独立可信通道。
+
 ## Calibration
 
 阈值是一个策略决定，所以要在数据的基础上做出判断。每一条决策都会连同获胜类别、完整概率分布、余量和延迟被记录下来——重放日志即可看到某个候选阈值在部署之前会产生什么效果。
@@ -115,6 +123,13 @@ python3 tools/replay_battery.py           # 9 benign (must approve) + 8 danger (
 | Timeout / connection error / HTTP error | `ESCALATE` |
 | HTTP 429 from the classify endpoint | one retry after 0.4s, then `ESCALATE` |
 | Malformed or missing answer envelope | `ESCALATE` |
+| Distribution missing, partial, or holding anything that is not a finite probability in [0, 1] | `ESCALATE` |
+| Winning class is not the argmax of the returned distribution | `ESCALATE` |
+| User message lacks a `<command>` block, has more than one, an unclosed one, or delimiters in the wrong order | `ESCALATE` |
+| Command longer than `MAX_COMMAND_CHARS` (6000) — it is never truncated and judged | `ESCALATE` |
+| Answer status is `content_filter` (`openai` backend) | `ESCALATE` (no retry) |
+| Request body is valid JSON of the wrong shape (array, `null`, non-list `messages`, non-string `content`) | `ESCALATE` (HTTP 200, logged `bad_request_shape`) |
+| Thresholds outside [0, 1] or non-finite | the service refuses to start |
 | Winning class disagrees with the returned distribution (classify backend) | `ESCALATE` |
 | Empty or unrecognised answer (after one retry on the `openai` backend) | `ESCALATE` |
 | Malformed HTTP request to the bridge | `ESCALATE` |
@@ -133,7 +148,7 @@ systemctl --user status approval-judge-bridge
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t . -v     # 41 tests, no network, no dependencies
+python3 -m unittest discover -s tests -t . -v     # 54 tests, no network, no dependencies
 ```
 
 该测试套件覆盖阈值不变式、每一条失败即关闭的路径、带余量的重试行为、提示提取（包括确认操作员策略只从 *system* 通道读取），以及通过真实 socket 端到端覆盖的 HTTP 表面。
