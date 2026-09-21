@@ -139,7 +139,7 @@ def main(config: Config | None = None) -> int:
     print(f"[bridge] backend={config.backend} on http://{config.host}:{config.port} "
           f"auto_accept={config.auto_accept} min_margin={config.min_margin} log={config.log_path} "
           f"details={described}", flush=True)
-    if not described.get("key_present", True) and config.backend != "rules":
+    if described.get("key_required", True) and not described.get("key_present", True):
         print(f"[bridge] WARNING: no API key found for backend {config.backend} "
               f"({config.env_file} or the environment) — every call will ESCALATE", flush=True)
     try:

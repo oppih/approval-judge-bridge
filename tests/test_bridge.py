@@ -16,7 +16,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from judge_bridge.backends import OpenAICompatibleBackend, RulesBackend, TypesafeBackend, build_backend
+from judge_bridge.backends import (
+    ClassifyBackend,
+    OpenAICompatibleBackend,
+    RulesBackend,
+    TypesafeBackend,
+    build_backend,
+)
 from judge_bridge.config import Config
 from judge_bridge.decision import escalate, from_classification
 from judge_bridge.prompts import extract_command, extract_flagged_as, extract_policy, normalize_word
@@ -29,11 +35,13 @@ class StubUpstream:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.requests: list[dict] = []
+        self.headers_seen: list[dict] = []
         stub = self
 
         class Upstream(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("Content-Length") or 0)
+                stub.headers_seen.append(dict(self.headers))
                 stub.requests.append(json.loads(self.rfile.read(length).decode() or "{}"))
                 payload = stub.responses[min(len(stub.requests) - 1, len(stub.responses) - 1)]
                 raw = json.dumps(payload).encode()
@@ -62,6 +70,15 @@ class StubUpstream:
 def jev_payload(choice: str, probabilities: dict, confidence: float = 0.9) -> dict:
     return {"answers": {"safety": {"choice": choice, "probabilities": probabilities, "confidence": confidence}},
             "usage": {"input_tokens": 800, "output_tokens": 1}}
+
+
+def classify_payload(value: str, probabilities: dict, model: str = "rlcd-qwen3-14b-v2") -> dict:
+    """A yajev-shaped answer: value + prob + per-class [logit, probability] scores."""
+    logits = {name: round(-1.0 + i * 0.1, 3) for i, name in enumerate(probabilities)}
+    return {"result": {"safety": {"value": value, "prob": probabilities[value],
+                                   "scores": {name: [logits[name], prob]
+                                               for name, prob in probabilities.items()}}},
+            "timing_ms": {"inference": 170.0, "total": 191.5}, "model": model}
 
 
 def chat_payload(content, finish_reason: str = "stop") -> dict:
@@ -201,6 +218,129 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
         finally:
             upstream.stop()
         assert decision.verdict == "DENY" and len(upstream.requests) == 1
+
+
+class TestClassifyBackend(unittest.TestCase):
+    """The classify envelope (yajev): same fail-closed invariants, three-class enum, no key."""
+
+    P = {"approve": 0.90, "deny": 0.07, "escalate": 0.03}
+
+    def test_request_shape_and_policy_channel(self):
+        upstream = StubUpstream(classify_payload("approve", dict(self.P)))
+        try:
+            decision = ClassifyBackend(f"{upstream.url}/v1/classify", "",
+                                       auto_accept=0.65, min_margin=0.30).judge(
+                "git status", "flagged", "never touch /etc")
+        finally:
+            upstream.stop()
+        assert decision.verdict == "APPROVE" and decision.top == 0.90
+        sent = upstream.requests[0]
+        context = sent["context"]
+        assert "<command>\ngit status\n</command>" in context
+        assert "never touch /etc" in context and "OPERATOR POLICY" in context
+        assert sent["schema"]["safety"]["type"] == "enum"
+        assert sent["schema"]["safety"]["choices"] == ["approve", "deny", "escalate"]
+        assert "ESCALATE" in sent["schema"]["safety"]["description"]
+
+    def test_low_probability_approve_escalates(self):
+        upstream = StubUpstream(classify_payload("approve", {"approve": 0.50, "deny": 0.45, "escalate": 0.05}))
+        try:
+            decision = ClassifyBackend(f"{upstream.url}/v1/classify", "",
+                                       auto_accept=0.65, min_margin=0.30).judge("git status", "x", "")
+        finally:
+            upstream.stop()
+        assert decision.verdict == "ESCALATE" and decision.classification == "approve"
+
+    def test_deny_winner_is_review_at_any_confidence(self):
+        upstream = StubUpstream(classify_payload("deny", {"deny": 0.99, "approve": 0.005, "escalate": 0.005}))
+        try:
+            decision = ClassifyBackend(f"{upstream.url}/v1/classify", "",
+                                       auto_accept=0.99, min_margin=0.99).judge("rm -rf /", "x", "")
+        finally:
+            upstream.stop()
+        assert decision.verdict == "DENY" and decision.decision == "review"
+
+    def test_keyless_endpoint_needs_no_key(self):
+        upstream = StubUpstream(classify_payload("approve", dict(self.P)))
+        try:
+            decision = ClassifyBackend(f"{upstream.url}/v1/classify", "",
+                                       auto_accept=0.65, min_margin=0.30).judge("git status", "x", "")
+        finally:
+            upstream.stop()
+        assert decision.verdict == "APPROVE" and len(upstream.requests) == 1
+
+    def test_auth_header_sent_only_when_key_configured(self):
+        upstream = StubUpstream(classify_payload("approve", dict(self.P)), classify_payload("approve", dict(self.P)))
+        try:
+            ClassifyBackend(f"{upstream.url}/v1/classify", "k", auto_accept=0.65, min_margin=0.3).judge("a", "x", "")
+            ClassifyBackend(f"{upstream.url}/v1/classify", "", auto_accept=0.65, min_margin=0.3).judge("b", "x", "")
+        finally:
+            upstream.stop()
+        assert upstream.headers_seen[0].get("Authorization") == "Bearer k"
+        assert "Authorization" not in upstream.headers_seen[1]
+
+    def test_missing_scores_fails_closed(self):
+        upstream = StubUpstream({"result": {"safety": {"value": "approve", "prob": 0.99}}})
+        try:
+            decision = ClassifyBackend(f"{upstream.url}/v1/classify", "",
+                                       auto_accept=0.65, min_margin=0.30).judge("rm -rf /", "x", "")
+        finally:
+            upstream.stop()
+        assert decision.verdict == "ESCALATE" and decision.reason == "invalid_response"
+
+    def test_unknown_class_fails_closed(self):
+        upstream = StubUpstream(classify_payload("MAYBE", {"MAYBE": 0.9, "approve": 0.05, "deny": 0.05}))
+        try:
+            decision = ClassifyBackend(f"{upstream.url}/v1/classify", "",
+                                       auto_accept=0.65, min_margin=0.30).judge("rm -rf /", "x", "")
+        finally:
+            upstream.stop()
+        assert decision.verdict == "ESCALATE" and decision.reason == "unknown_class:maybe"
+
+    def test_inconsistent_envelope_fails_closed(self):
+        # The winning value and the argmax of the distribution disagree: trust neither.
+        upstream = StubUpstream(classify_payload("approve", {"deny": 0.90, "approve": 0.05, "escalate": 0.05}))
+        try:
+            decision = ClassifyBackend(f"{upstream.url}/v1/classify", "",
+                                       auto_accept=0.65, min_margin=0.30).judge("rm -rf /", "x", "")
+        finally:
+            upstream.stop()
+        assert decision.verdict == "ESCALATE" and decision.reason == "inconsistent_envelope"
+
+    def test_empty_command_fails_closed_without_a_call(self):
+        upstream = StubUpstream(classify_payload("approve", dict(self.P)))
+        try:
+            decision = ClassifyBackend(f"{upstream.url}/v1/classify", "",
+                                       auto_accept=0.65, min_margin=0.30).judge("   ", "x", "")
+        finally:
+            upstream.stop()
+        assert decision.verdict == "ESCALATE" and decision.reason == "empty_command"
+        assert upstream.requests == []
+
+
+class TestYajevWiring(unittest.TestCase):
+    """Config -> build_backend -> JudgeService end-to-end, offline, like the typesafe wiring tests."""
+
+    def test_config_and_service_round_trip(self):
+        upstream = StubUpstream(classify_payload("approve", {"approve": 0.92, "deny": 0.06, "escalate": 0.02}))
+        with TemporaryDirectory() as tmp:
+            try:
+                config = Config(backend="yajev", host="127.0.0.1", port=0,
+                                yajev_api_url=f"{upstream.url}/v1/classify",
+                                log_path=Path(tmp) / "decisions.jsonl")
+                model, decision, record = JudgeService(config).judge_request(dict(GUARDIAN_BODY))
+            finally:
+                upstream.stop()
+        assert model == "judge"
+        assert decision.verdict == "APPROVE" and decision.classification == "approve"
+        assert record["backend"] == "yajev"
+        assert upstream.requests[0]["schema"]["safety"]["choices"] == ["approve", "deny", "escalate"]
+
+    def test_unreadable_rubric_file_fails_at_startup(self):
+        with TemporaryDirectory() as tmp:
+            config = Config(backend="yajev", yajev_rubric_file=str(Path(tmp) / "nope.txt"))
+            with self.assertRaises(ValueError):
+                config.backend_options()
 
 
 class TestRulesBackend(unittest.TestCase):

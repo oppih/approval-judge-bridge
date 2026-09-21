@@ -41,6 +41,11 @@ class Config:
     typesafe_api_url: str = "https://api.typesafe.ai/v1/systemone"
     typesafe_model: str = "jev-latest"
     typesafe_api_key: str = ""
+    # classify-envelope judge (reference: the yajev demo; keyless by design)
+    yajev_api_url: str = "https://yajev.0xfefe.me/v1/classify"
+    yajev_api_key: str = ""
+    yajev_rubric_file: str = ""
+    yajev_max_description: int = 2000
     openai_base_url: str = ""
     openai_model: str = ""
     openai_api_key: str = ""
@@ -65,6 +70,10 @@ class Config:
             typesafe_api_url=os.environ.get("TYPESAFE_API_URL", "https://api.typesafe.ai/v1/systemone"),
             typesafe_model=os.environ.get("TYPESAFE_MODEL", "jev-latest"),
             typesafe_api_key=read_secret_from_env_file(env_file, "TYPESAFE_API_KEY", "MCP_JEV_API_KEY"),
+            yajev_api_url=os.environ.get("JUDGE_YAJEV_URL", "https://yajev.0xfefe.me/v1/classify"),
+            yajev_api_key=read_secret_from_env_file(env_file, "JUDGE_YAJEV_API_KEY"),
+            yajev_rubric_file=os.environ.get("JUDGE_YAJEV_RUBRIC_FILE", ""),
+            yajev_max_description=_int("JUDGE_YAJEV_MAX_DESCRIPTION", 2000),
             openai_base_url=os.environ.get("JUDGE_OPENAI_BASE_URL", ""),
             openai_model=os.environ.get("JUDGE_OPENAI_MODEL", ""),
             openai_api_key=read_secret_from_env_file(env_file, "JUDGE_OPENAI_API_KEY"),
@@ -79,6 +88,17 @@ class Config:
         if self.backend == "typesafe":
             return {"api_url": self.typesafe_api_url, "model": self.typesafe_model, "api_key": self.typesafe_api_key,
                     "auto_accept": self.auto_accept, "min_margin": self.min_margin, "timeout": self.timeout}
+        if self.backend == "yajev":
+            rubric = None
+            if self.yajev_rubric_file:
+                try:
+                    rubric = Path(self.yajev_rubric_file).read_text()
+                except OSError as exc:  # a misconfigured unit fails at startup, loudly
+                    raise ValueError(f"JUDGE_YAJEV_RUBRIC_FILE is unreadable: {exc}") from exc
+            return {"api_url": self.yajev_api_url, "api_key": self.yajev_api_key,
+                    "rubric": rubric, "max_description": self.yajev_max_description,
+                    "auto_accept": self.auto_accept, "min_margin": self.min_margin,
+                    "timeout": self.timeout}
         if self.backend == "openai":
             if not self.openai_base_url or not self.openai_model:
                 raise ValueError("JUDGE_OPENAI_BASE_URL and JUDGE_OPENAI_MODEL are required for the openai backend")
@@ -87,4 +107,4 @@ class Config:
                     "timeout": self.timeout}
         if self.backend == "rules":
             return {"path": self.rules_path}
-        raise ValueError(f"unknown JUDGE_BACKEND: {self.backend!r} (expected typesafe, openai or rules)")
+        raise ValueError(f"unknown JUDGE_BACKEND: {self.backend!r} (expected typesafe, yajev, openai or rules)")
