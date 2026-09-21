@@ -43,9 +43,10 @@ class StubUpstream:
                 length = int(self.headers.get("Content-Length") or 0)
                 stub.headers_seen.append(dict(self.headers))
                 stub.requests.append(json.loads(self.rfile.read(length).decode() or "{}"))
-                payload = stub.responses[min(len(stub.requests) - 1, len(stub.responses) - 1)]
+                entry = stub.responses[min(len(stub.requests) - 1, len(stub.responses) - 1)]
+                code, payload = entry if isinstance(entry, tuple) else (200, entry)
                 raw = json.dumps(payload).encode()
-                self.send_response(200)
+                self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
@@ -316,6 +317,23 @@ class TestClassifyBackend(unittest.TestCase):
             upstream.stop()
         assert decision.verdict == "ESCALATE" and decision.reason == "empty_command"
         assert upstream.requests == []
+
+    def test_rate_limit_is_retried_once_then_fails_closed(self):
+        ok = classify_payload("approve", dict(self.P))
+        upstream = StubUpstream((429, {"error": "rate"}), ok, (429, {"error": "rate"}), (429, {"error": "rate"}))
+        try:
+            backend = ClassifyBackend(f"{upstream.url}/v1/classify", "", auto_accept=0.65, min_margin=0.30)
+            decision = backend.judge("git status", "x", "")
+            after_first = len(upstream.requests)  # count before the second call runs
+            blocked = backend.judge("git status", "x", "")
+            after_second = len(upstream.requests)
+        finally:
+            upstream.stop()
+        assert decision.verdict == "APPROVE" and after_first == 2, (
+            f"first call: verdict={decision.verdict} reason={decision.reason} requests={after_first}")
+        assert blocked.verdict == "ESCALATE" and blocked.reason == "http_429", (
+            f"second call: verdict={blocked.verdict} reason={blocked.reason}")
+        assert after_second == 4, f"two attempts per call, never more (requests={after_second})"
 
 
 class TestYajevWiring(unittest.TestCase):
