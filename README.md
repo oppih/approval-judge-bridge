@@ -75,7 +75,11 @@ The `openai` backend rebuilds the reviewer prompt itself (so both machine judges
 question) and retries **once** with a larger budget when the answer is truncated or unusable —
 the reasoning-model failure mode above — before failing closed. The `rules` backend resolves
 `deny` → `escalate` → `approve` in order and escalates anything unmatched, so the file decides
-what is *allowed* and the absence of a rule is never permission.
+what is *allowed* and the absence of a rule is never permission. Two properties keep that
+honest: an `approve` pattern must match the **whole** command (a matching prefix cannot show
+that a compound command is safe — `deny`/`escalate` stay substring searches), and when the host
+sends operator policy the backend escalates instead of ignoring it, because a rule file has no
+way to honour rules it cannot read.
 
 The `yajev` backend speaks a different envelope on purpose: the classify endpoint takes
 `{context, schema}` (schema fields are enums or booleans) and answers with a value, a
@@ -199,6 +203,11 @@ It exits non-zero if any benign command fails to approve or any dangerous one ap
 | Winning class disagrees with the returned distribution (classify backend) | `ESCALATE` |
 | Empty or unrecognised answer (after one retry on the `openai` backend) | `ESCALATE` |
 | Malformed HTTP request to the bridge | `ESCALATE` |
+| Request body over `MAX_REQUEST_BODY_BYTES` (1 MiB) or a negative `Content-Length` | `ESCALATE` (logged `request_too_large`, body not read) |
+| Client stalls while sending a declared body | `ESCALATE` (logged `request_read_timeout`) |
+| Upstream response over `MAX_UPSTREAM_RESPONSE_BYTES` (1 MiB) | `ESCALATE` |
+| Operator policy is non-empty on the `rules` backend | `ESCALATE` (`policy_not_supported`) |
+| Classify backend: policy or assembled context over its budget | `ESCALATE` (`policy_too_long` / `context_too_long`, never truncated) |
 
 ## Run as a service
 
@@ -216,14 +225,16 @@ previous provider).
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t . -v     # 54 tests, no network, no dependencies
+python3 -m unittest discover -s tests -t . -v     # 63 tests, no network, no dependencies
 ```
 
 The suite covers the thresholds invariant, every fail-closed path (invalid, partial and
 contradictory distributions; malformed request shapes; ambiguous command envelopes;
-truncated or verbose model answers), the retry-with-headroom behaviour, prompt extraction
-(including that operator policy is read from the *system* channel only), and the HTTP
-surface end-to-end over a real socket.
+truncated or verbose model answers; oversized, negative and stalled request bodies),
+the retry-with-headroom behaviour, prompt extraction (operator policy is read from the
+*system* channel only, and the flag description never from inside the command block),
+whole-command matching for `rules` approvals, concurrent decision-log writes, and the
+HTTP surface end-to-end over a real socket.
 
 ## What this is not
 
