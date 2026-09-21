@@ -57,6 +57,11 @@ Any other host needs only a base URL and a model name — the endpoint speaks
 
 ## Backends
 
+Four judges, four protocols — this table is the bridge's **compatibility surface**. A host only
+ever needs a `base_url` and a model name; whichever row is behind the endpoint, the host keeps
+sending its ordinary guardian call and keeps reading one word back. Adding a judge means adding a
+backend, never patching a host.
+
 | `JUDGE_BACKEND` | Judge | Needs |
 |---|---|---|
 | `typesafe` (default) | Jev (System One): one Choice question, probabilities + confidence | `TYPESAFE_API_KEY` (or `MCP_JEV_API_KEY`) |
@@ -72,7 +77,10 @@ what is *allowed* and the absence of a rule is never permission.
 
 The `yajev` backend speaks a different envelope on purpose: the classify endpoint takes
 `{context, schema}` (schema fields are enums or booleans) and answers with a value, a
-probability, and per-class `[logit, probability]` scores. It is not a second URL for the
+probability, and per-class `[logit, probability]` scores. Its reference is
+[dongxu's self-hosted Jev clone](https://yajev.0xfefe.me/) — a 14B judge on a home GPU, keyless,
+no SLA — and it is the same envelope any self-hosted Jev-style service speaks, so pointing the
+bridge at your own clone is a URL change. It is *not* a second URL for the
 typed backend — the upstream Jev API has no `/v1/classify`, and the request and answer
 shapes differ. Because the envelope has a single `context` string, operator policy is
 marked inside it rather than carried in a separate trusted channel (see the class docstring),
@@ -101,6 +109,10 @@ once after 0.4s and then fails closed. Latency is ~0.35s per call through the br
 
 Run `tools/replay_battery.py` against the bridge after any rubric change — the same command can
 flip between `approve` and `deny` on wording alone, in both directions.
+
+`typesafe` stays the default and the reference deployment keeps Jev as its gate; the classify
+backend is the compatibility option, measured and passing, for anyone whose judge comes in that
+envelope.
 
 Environment:
 
