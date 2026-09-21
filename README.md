@@ -187,6 +187,22 @@ judged safe enough to skip a prompt — not proven safe. Keep hardline blocks, a
 agent's own permission model underneath, keep the trust boundary intact (operator rules from the
 system message, command text untrusted), and treat `ESCALATE` as normal for anything consequential.
 
+## Open work
+
+Two bottlenecks remain, and both are about keeping the gate useful rather than making it work —
+the fail-closed behaviour itself is tested. Details and acceptance criteria: [TODO.md](TODO.md).
+
+- **Judge failover.** Fail-closed means an unreachable judge escalates everything, so an upstream
+  outage degrades the gate into prompting for every flagged command — the symptom this project
+  exists to remove. Measured 2026-09-21: while Jev was overloaded, 16 of 17 battery commands
+  escalated without ever being judged (15 × `http_529`, 1 × `TimeoutError`). The fallback chain has
+  to be transport-only (never re-judge a verdict), carry its own thresholds, pass the battery
+  itself, and show on `/healthz` which judge answered.
+- **Calibration regression.** The 17-command battery is hand-tuned and a command can flip between
+  `approve` and `deny` on rubric wording alone, while the real sample is 37 distinct commands in a
+  log that rotates after one generation. Replay them as fixtures so a rubric edit cannot silently
+  flip a command, and add a rubric-diff mode that prints the flips before release.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
