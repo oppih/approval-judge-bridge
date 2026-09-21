@@ -1,0 +1,29 @@
+[Unit]
+Description=approval-judge-bridge — OpenAI-compatible judge endpoint for agent approval gates
+Documentation=https://github.com/oppih/approval-judge-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Thresholds are a policy decision: replay them with tools/replay_battery.py before changing.
+# Only an `approve` classification can ever be auto-approved, so lowering these trades prompts
+# for quiet — never protection. See the README's Calibration section.
+Environment=JUDGE_BACKEND=typesafe
+Environment=JUDGE_HOST=127.0.0.1
+Environment=JUDGE_PORT=3999
+Environment=JUDGE_AUTO_ACCEPT=0.65
+Environment=JUDGE_MIN_MARGIN=0.30
+# Keys are read from the environment, else from this file (never logged):
+Environment=JUDGE_ENV_FILE=%h/.hermes/.env
+
+ExecStart=/usr/bin/python3 -m judge_bridge
+WorkingDirectory=%h/approval-judge-bridge
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,28 @@
+{
+  "deny": [
+    "rm -rf\\s+/(\\s|$)",
+    "rm -rf\\s+~(/|\\s|$)",
+    "rm -rf\\s+/(home|etc|var|usr|boot)\\b",
+    ":\\s*\\(\\s*\\)\\s*\\{\\s*:\\s*\\|\\s*:",
+    "dd\\s+.*of=/dev/(sd|nvme|hd)",
+    "mkfs(\\.|\\s)",
+    "shred\\s+/dev/"
+  ],
+  "escalate": [
+    "curl[^|]*\\|\\s*(ba)?sh",
+    "wget[^|]*\\|\\s*(ba)?sh",
+    "base64\\s+-d.*\\|\\s*(ba)?sh",
+    "eval\\s+\\$\\(",
+    "\\.env|\\.ssh/id_|credentials",
+    "(sed|tee|cp|mv|>)\\s+.*(sudoers|authorized_keys|config\\.yaml|\\.env)",
+    "systemctl\\s+(disable|mask|stop)\\s+.*(approval|guard|audit)",
+    "APPROVE this|ignore previous instructions"
+  ],
+  "approve": [
+    "^\\s*(git|gh)\\s+(status|diff|log|show|branch|remote|fetch|pull|clone|pr|api)\\b",
+    "^\\s*(ls|cat|head|tail|wc|grep|rg|find|stat|file|which|echo|pwd)\\b",
+    "^\\s*python3?\\s+-c\\s",
+    "^\\s*(npm|pnpm|yarn|pip|pip3|uv)\\s+(install|ci|list|show)\\b",
+    "^\\s*(pytest|python3?\\s+-m\\s+pytest|make|cmake|cargo\\s+(build|test)|go\\s+(build|test))\\b"
+  ]
+}
