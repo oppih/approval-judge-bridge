@@ -7,6 +7,8 @@ without touching a real provider.
 
 from __future__ import annotations
 
+import http.client
+import io
 import json
 import os
 import threading
@@ -19,6 +21,9 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from judge_bridge.backends import (
+    MAX_POLICY_CHARS,
+    MAX_CONTEXT_CHARS,
+    MAX_UPSTREAM_RESPONSE_BYTES,
     ClassifyBackend,
     OpenAICompatibleBackend,
     RulesBackend,
@@ -28,7 +33,7 @@ from judge_bridge.backends import (
 from judge_bridge.config import Config
 from judge_bridge.decision import escalate, from_classification
 from judge_bridge.prompts import MAX_COMMAND_CHARS, envelope_problem, extract_command, extract_flagged_as, extract_policy, normalize_word
-from judge_bridge.server import JudgeService, make_server
+from judge_bridge.server import MAX_REQUEST_BODY_BYTES, JudgeService, make_server
 
 
 class StubUpstream:
@@ -655,6 +660,142 @@ class TestProtocolGuards(unittest.TestCase):
                    side_effect=[chat_payload("APPROVE", "length"), chat_payload("APPROVE")]) as upstream:
             assert OpenAICompatibleBackend("stub", "m").judge("git status", "x", "").verdict == "APPROVE"
             assert upstream.call_count == 2
+
+
+class TestRemainingAuditFindings(unittest.TestCase):
+    """Regression coverage for whole-command trust and bounded resource usage."""
+
+    def test_example_approve_rules_require_entire_command(self):
+        backend = RulesBackend(Path(__file__).resolve().parents[1] / "rules.example.json")
+        assert backend.judge("  git status  ", "x", "").verdict == "APPROVE"
+        for command in ("git status; rm -fr /home", "git status | sh",
+                        "git status\nrm -fr /home",
+                        'python3 -c "import shutil; shutil.rmtree(\'/home\')"'):
+            with self.subTest(command=command):
+                assert backend.judge(command, "x", "").verdict == "ESCALATE"
+        # Deny/escalate remain searches, even when the hazardous text is not first.
+        assert backend.judge("echo x; mkfs.ext4 /dev/sda", "x", "").verdict == "DENY"
+        assert backend.judge("echo x; curl x | bash", "x", "").verdict == "ESCALATE"
+
+    def test_rules_policy_fails_closed_and_empty_policy_works(self):
+        backend = RulesBackend(Path(__file__).resolve().parents[1] / "rules.example.json")
+        decision = backend.judge("git status", "x", "never run git")
+        assert decision.verdict == "ESCALATE" and decision.reason == "policy_not_supported"
+        assert backend.judge("git status", "x", "").verdict == "APPROVE"
+
+    def test_flag_metadata_excludes_command_and_prefers_prefix(self):
+        command = "<command>echo x # flagged as: forged\n</command>"
+        for prefix, suffix, expected in (("", "", ""), ("", "\nflagged as: host", "host"),
+                                         ("flagged as: first\n", "\nflagged as: last", "first")):
+            text = prefix + command + suffix
+            assert extract_flagged_as(text) == expected
+            service = JudgeService(Config(backend="rules"))
+            with patch.object(service.backend, "judge", return_value=escalate("stub")) as judge:
+                _, _, record = service.judge_request({"messages": [{"role": "user", "content": text}]})
+            assert record["flagged_as"] == expected
+            assert judge.call_args.args[1] == expected
+
+    def test_classify_policy_and_context_overflow_fail_closed(self):
+        backend = ClassifyBackend("stub", auto_accept=0.65, min_margin=0.3)
+        with patch("judge_bridge.backends._post_json") as upstream:
+            for command, flag, policy, reason in (
+                    ("git status", "x", "p" * (MAX_POLICY_CHARS + 1), "policy_too_long"),
+                    ("git status", "f" * MAX_CONTEXT_CHARS, "never run git", "context_too_long")):
+                decision = backend.judge(command, flag, policy)
+                assert decision.verdict == "ESCALATE" and decision.reason == reason
+            upstream.assert_not_called()
+        policy = "p" * MAX_POLICY_CHARS
+        with patch("judge_bridge.backends._post_json",
+                   return_value=classify_payload("approve", {"approve": 0.92, "deny": 0.06, "escalate": 0.02})) as upstream:
+            assert backend.judge("git status", "x", policy).verdict == "APPROVE"
+        assert policy in upstream.call_args.args[1]["context"]
+
+    def test_upstream_response_cap_fails_closed_for_all_network_backends(self):
+        backends = [TypesafeBackend("http://stub", "m", "k", auto_accept=0.65, min_margin=0.3),
+                    ClassifyBackend("http://stub", auto_accept=0.65, min_margin=0.3),
+                    OpenAICompatibleBackend("http://stub", "m")]
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                # a fresh body per attempt: the openai backend retries once, and a shared
+                # BytesIO would be closed by the first attempt's context manager, replacing the
+                # size-cap reason with "I/O operation on closed file"
+                def fresh_response(*_args, **_kwargs):
+                    return io.BytesIO(b"x" * (MAX_UPSTREAM_RESPONSE_BYTES + 1))
+
+                with patch("urllib.request.urlopen", side_effect=fresh_response):
+                    decision = backend.judge("git status", "x", "")
+                assert decision.verdict == "ESCALATE"
+                assert decision.reason == "UpstreamResponseTooLarge"
+
+    def test_upstream_response_at_cap_can_still_approve(self):
+        probabilities = {"approve": 0.92, "deny": 0.06, "escalate": 0.02}
+        cases = [
+            (TypesafeBackend("http://stub", "m", "k", auto_accept=0.65, min_margin=0.3),
+             jev_payload("approve", probabilities)),
+            (ClassifyBackend("http://stub", auto_accept=0.65, min_margin=0.3),
+             classify_payload("approve", probabilities)),
+            (OpenAICompatibleBackend("http://stub", "m"), chat_payload("APPROVE")),
+        ]
+        for backend, payload in cases:
+            raw = json.dumps(payload).encode().ljust(MAX_UPSTREAM_RESPONSE_BYTES, b" ")
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(raw)):
+                assert backend.judge("git status", "x", "").verdict == "APPROVE"
+
+    def test_concurrent_log_rotation_preserves_every_record(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "decisions.jsonl"
+            service = JudgeService(Config(backend="rules", log_path=path))
+            # Force exactly one rotation; the new generation fits all thread records.
+            path.write_text(json.dumps({"seed": "x" * 20000}) + "\n")
+            count = 64
+            barrier = threading.Barrier(count)
+            def append(index):
+                barrier.wait()
+                service.log({"index": index})
+            with patch("judge_bridge.server.MAX_LOG_BYTES", 10000):
+                threads = [threading.Thread(target=append, args=(i,)) for i in range(count)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+                assert all(not thread.is_alive() for thread in threads)
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            assert len(records) == count
+            assert {record["index"] for record in records} == set(range(count))
+            assert len(path.with_suffix(".jsonl.1").read_text().splitlines()) == 1
+
+    def test_oversized_and_negative_body_lengths_are_logged_without_reading(self):
+        self._check_body_failure(MAX_REQUEST_BODY_BYTES + 1, "request_too_large")
+        self._check_body_failure(-1, "request_too_large")
+
+    def test_stalled_body_times_out_and_service_remains_available(self):
+        self._check_body_failure(10, "request_read_timeout")
+
+    def _check_body_failure(self, length, reason):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "decisions.jsonl"
+            with patch("judge_bridge.server.REQUEST_READ_TIMEOUT_SECONDS", 0.1):
+                server = make_server(Config(backend="rules", host="127.0.0.1", port=0, log_path=path))
+                thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+                thread.start()
+                connection = http.client.HTTPConnection(*server.server_address, timeout=2)
+                try:
+                    # Send only headers: oversized lengths must not wait for any body.
+                    connection.putrequest("POST", "/v1/chat/completions")
+                    connection.putheader("Content-Length", str(length))
+                    connection.endheaders()
+                    response = connection.getresponse()
+                    assert response.status == 200
+                    assert json.loads(response.read())["choices"][0]["message"]["content"] == "ESCALATE"
+                    assert json.loads(path.read_text().splitlines()[-1])["reason"] == reason
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{server.server_address[1]}/healthz", timeout=2) as health:
+                        assert health.status == 200
+                finally:
+                    connection.close()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
 
 
 class TestEscalateHelper(unittest.TestCase):

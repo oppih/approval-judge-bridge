@@ -49,8 +49,15 @@ def extract_command(user_text: str) -> str:
 
 
 def extract_flagged_as(user_text: str) -> str:
-    match = FLAGGED_RE.search(user_text or "")
-    return match.group(1).strip() if match else ""
+    """Read host metadata before the command, falling back to text after it."""
+    prefix, opening, rest = (user_text or "").partition("<command>")
+    # Never promote a line from inside untrusted command text into host metadata.
+    suffix = rest.partition("</command>")[2] if opening else ""
+    for outside in (prefix, suffix):
+        match = FLAGGED_RE.search(outside)
+        if match:
+            return match.group(1).strip()
+    return ""
 
 
 def extract_policy(system_text: str) -> str:

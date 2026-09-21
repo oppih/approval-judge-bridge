@@ -10,6 +10,7 @@ the integration.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +20,10 @@ from .config import Config
 from .decision import Decision, escalate
 from .prompts import envelope_problem, extract_command, extract_flagged_as, extract_policy
 
+# Fixed limits keep local malformed/stalled callers from consuming unbounded resources.
+MAX_REQUEST_BODY_BYTES = 1024 * 1024  # 1 MiB; reject before reading the body
+REQUEST_READ_TIMEOUT_SECONDS = 5.0  # socket idle timeout and total body-read deadline
+
 MAX_LOG_BYTES = 16 * 1024 * 1024
 
 
@@ -26,19 +31,22 @@ class JudgeService:
     """Backend + decision log. One instance per process; the handler is stateless."""
 
     def __init__(self, config: Config):
+        # Handlers share this service; rotation and append must be one atomic operation.
+        self._log_lock = threading.Lock()
         self.config = config
         self.backend = build_backend(config.backend, config.backend_options())
 
     def log(self, record: dict) -> None:
-        try:
-            path = self.config.log_path
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists() and path.stat().st_size > MAX_LOG_BYTES:  # keep one generation
-                path.replace(path.with_suffix(path.suffix + ".1"))
-            with path.open("a") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError:
-            pass  # observability must never break the gate
+        with self._log_lock:
+            try:
+                path = self.config.log_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.exists() and path.stat().st_size > MAX_LOG_BYTES:  # keep one generation
+                    path.replace(path.with_suffix(path.suffix + ".1"))
+                with path.open("a") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except OSError:
+                pass  # observability must never break the gate
 
     def judge_request(self, body: dict) -> tuple[str, Decision, dict]:
         """(model, decision, log record) for one guardian call."""
@@ -92,6 +100,29 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "approval-judge-bridge/1.0"
     service: JudgeService  # set on the server class by make_server()
 
+    def setup(self):
+        super().setup()
+        # Also bound idle reads while the stdlib handler parses request headers.
+        self.connection.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
+
+    def _read_body(self, length: int) -> bytes:
+        deadline = time.monotonic() + REQUEST_READ_TIMEOUT_SECONDS
+        chunks = []
+        remaining = length
+        while remaining:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("request_read_timeout")
+            self.connection.settimeout(budget)
+            # read1 returns after one underlying read, so trickled bytes cannot reset
+            # the total deadline as they would with a single buffered read(length).
+            chunk = self.rfile.read1(min(remaining, 65536))
+            if not chunk:
+                raise ValueError("incomplete_request_body")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
     def _send(self, code: int, payload: dict) -> None:
         raw = json.dumps(payload).encode()
         self.send_response(code)
@@ -116,11 +147,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(length).decode() or "{}")
+            if length < 0 or length > MAX_REQUEST_BODY_BYTES:
+                raise ValueError("request_too_large")
+            body = json.loads(self._read_body(length).decode() or "{}")
         except Exception as exc:  # malformed request → fail closed, still a valid completion
-            self.service.log({"ts": time.time(), "verdict": "ESCALATE", "reason": f"bad_request: {type(exc).__name__}"})
+            reason = ("request_read_timeout" if isinstance(exc, TimeoutError) else
+                      "request_too_large" if str(exc) == "request_too_large" else
+                      f"bad_request: {type(exc).__name__}")
+            # Unread bytes must not become another request on this connection.
+            self.close_connection = True
+            self.connection.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
+            self.service.log({"ts": time.time(), "verdict": "ESCALATE", "reason": reason})
             self._send(200, self._completion("ESCALATE"))
             return
+        self.connection.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
         model, decision, record = self.service.judge_request(body)
         self.service.log(record)
         self._send(200, self._completion(decision.verdict, model=model))

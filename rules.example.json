@@ -19,10 +19,10 @@
     "APPROVE this|ignore previous instructions"
   ],
   "approve": [
-    "^\\s*(git|gh)\\s+(status|diff|log|show|branch|remote|fetch|pull|clone|pr|api)\\b",
-    "^\\s*(ls|cat|head|tail|wc|grep|rg|find|stat|file|which|echo|pwd)\\b",
-    "^\\s*python3?\\s+-c\\s",
-    "^\\s*(npm|pnpm|yarn|pip|pip3|uv)\\s+(install|ci|list|show)\\b",
-    "^\\s*(pytest|python3?\\s+-m\\s+pytest|make|cmake|cargo\\s+(build|test)|go\\s+(build|test))\\b"
+    "git (status|diff|log|show|branch|remote)",
+    "(ls|pwd)",
+    "(npm|pnpm|yarn) (install|ci|list)",
+    "(pip|pip3|uv pip) list",
+    "(pytest|python3? -m pytest|make|cmake --version|cargo (build|test)|go (build|test))"
   ]
 }

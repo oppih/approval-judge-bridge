@@ -12,7 +12,9 @@
   known candidate set instead of generating text — but not Jev's envelope, so it is a separate
   backend rather than a URL change on ``typesafe``.
 * ``rules``     — deterministic regex policy from a JSON file. No network, no model; useful
-  as a floor under the others and for tests.
+  as a floor under the others and for tests. Approve patterns full-match the stripped
+  command; deny and escalate patterns search anywhere. Operator policy is unsupported
+  and causes escalation rather than being ignored.
 
 Every backend returns a :class:`Decision` and every failure path returns ESCALATE. A backend
 never returns APPROVE because it could not tell.
@@ -124,6 +126,14 @@ CLASSIFY_CONTEXT_NOTE = (
 MAX_POLICY_CHARS = 1500
 MAX_CONTEXT_CHARS = 7500     # leave headroom below the endpoint's 8000-character limit
 
+# Bound upstream allocation even when a provider returns an unexpected large body.
+MAX_UPSTREAM_RESPONSE_BYTES = 1024 * 1024  # 1 MiB, shared by all network backends
+
+
+class UpstreamResponseTooLarge(ValueError):
+    """The upstream response cannot be safely consumed within the byte budget."""
+
+
 _TRUNCATION_RETRY_TOKENS = 256
 
 
@@ -143,7 +153,10 @@ class Backend(ABC):
 def _post_json(url: str, body: dict, headers: dict, timeout: float) -> dict:
     request = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode())
+        raw = response.read(MAX_UPSTREAM_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_UPSTREAM_RESPONSE_BYTES:
+            raise UpstreamResponseTooLarge("upstream_response_too_large")
+        return json.loads(raw.decode())
 
 
 class TypesafeBackend(Backend):
@@ -252,7 +265,7 @@ class ClassifyBackend(Backend):
         blocks = []
         if policy:
             blocks.append("OPERATOR POLICY (trusted rules from the operator: a command that a rule "
-                          f"forbids must not be approved):\n{policy[:MAX_POLICY_CHARS]}")
+                          f"forbids must not be approved):\n{policy}")
         blocks.append(f"The following shell command was flagged by the host as: "
                       f"{flagged_as or 'dangerous command'}. {CLASSIFY_CONTEXT_NOTE}")
         blocks.append(f"<command>\n{command}\n</command>")
@@ -268,6 +281,9 @@ class ClassifyBackend(Backend):
         if not command.strip():
             # The endpoint rejects an empty context with 400; say why in the log instead.
             return escalate("empty_command")
+        # Partial policy could omit the very prohibition that changes the verdict.
+        if len(policy) > MAX_POLICY_CHARS:
+            return escalate("policy_too_long")
         context = self._context(command, flagged_as, policy)
         if len(context) > MAX_CONTEXT_CHARS:
             return escalate("context_too_long")
@@ -390,10 +406,15 @@ class RulesBackend(Backend):
                 "rules": {"deny": len(self.deny), "escalate": len(self.escalate), "approve": len(self.approve)}}
 
     def judge(self, command: str, flagged_as: str, policy: str) -> Decision:
+        # Regex command rules cannot interpret trusted natural-language constraints.
+        if policy:
+            return escalate("policy_not_supported")
         for classification, patterns in (("deny", self.deny), ("escalate", self.escalate),
                                          ("approve", self.approve)):
             for pattern in patterns:
-                if pattern.search(command):
+                match = (pattern.fullmatch(command.strip()) if classification == "approve"
+                         else pattern.search(command))
+                if match:
                     return from_classification(classification, None, auto_accept=0.0, min_margin=0.0)
         return escalate("no_rule_matched")
 
