@@ -15,7 +15,7 @@ approval-judge-bridge 提供兼容 OpenAI 的端点，接收 agent 的**审批�
 - **所有失败都按失败即关闭处理。** 缺少密钥、超时、HTTP 错误、响应体格式错误、未知类别，或重试一次后仍无答案，都会返回 `ESCALATE`。桥接服务绝不会因为无法判断就返回 `APPROVE`。
 - **始终遵守一条安全不变式。** 只有分类结果为 `approve` 时，才可能自动批准。无论阈值如何设置，只要最终类别是 `deny` 或 `escalate`，就交由人工处理。因此，降低阈值只会减少确认提示，不会削弱保护。
 
-## Quickstart
+## 快速开始
 
 ```bash
 git clone https://github.com/oppih/approval-judge-bridge
@@ -40,7 +40,7 @@ approvals:
 
 其他宿主只需设置基础 URL 和模型名。端点支持 `POST /v1/chat/completions`，通过 `choices[0].message.content` 返回一个词。
 
-## Backends
+## 判定后端
 
 桥接服务支持四种判定器，分别使用四种协议，下表列出了**兼容范围**。宿主只需提供 `base_url` 和模型名，无论使用哪个后端，都照常发送守卫调用并读取返回的单个词。接入新判定器只需增加后端，无需修改宿主。
 
@@ -85,7 +85,7 @@ approvals:
 
 密钥从环境变量或 env 文件读取，**绝不**写入日志。
 
-## Input requirements
+## 输入要求
 
 桥接服务只判定一条完整、无歧义的命令：
 
@@ -93,7 +93,7 @@ approvals:
 - 命令长度超过 `MAX_COMMAND_CHARS`（6000 字符）时，一律转交人工。桥接服务绝不会静默截断命令，只凭开头的无害内容作判断。
 - 操作员策略仍然只从系统消息读取。`yajev` 后端的传输格式只有一个 context 字段，因此会在该字段内标记策略块，而不是通过独立通道传递。
 
-## Calibration
+## 校准
 
 阈值属于策略选择，应以数据为依据。每次决策都会记录最终类别、完整概率分布、余量和延迟。部署新阈值前，可以重放日志，查看候选阈值会产生什么结果。
 
@@ -111,7 +111,7 @@ python3 tools/replay_battery.py           # 9 benign (must approve) + 8 danger (
 
 只要有一条无害命令未获批准，或一条危险命令获批，脚本就以非零退出码退出。
 
-## Failure semantics
+## 失败语义
 
 | 情况 | 判定结果 |
 |---|---|
@@ -138,7 +138,7 @@ python3 tools/replay_battery.py           # 9 benign (must approve) + 8 danger (
 | `rules` 后端收到非空操作员策略 | `ESCALATE`（`policy_not_supported`） |
 | classify 后端的策略或拼装后的上下文超出预算 | `ESCALATE`（`policy_too_long` / `context_too_long`，绝不截断） |
 
-## Run as a service
+## 作为服务运行
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -149,7 +149,7 @@ systemctl --user status approval-judge-bridge
 
 该服务单元只监听回环地址，并在失败后自动重启。回滚只需运行 `systemctl --user disable --now approval-judge-bridge`，再将宿主改回原来的提供方。
 
-## Tests
+## 测试
 
 ```bash
 python3 -m unittest discover -s tests -t . -v     # 63 tests, no network, no dependencies
@@ -157,7 +157,7 @@ python3 -m unittest discover -s tests -t . -v     # 63 tests, no network, no dep
 
 测试套件覆盖阈值不变式、所有失败即关闭路径（无效、不完整或相互矛盾的概率分布，请求结构错误，命令报文存在歧义，模型回答遭到截断或过于冗长，请求体过大、长度为负或传输停滞），以及增加预算后重试的行为。它还验证提示词提取，确保操作员策略只从*系统*通道读取，且绝不从命令块内部提取命令标记原因的描述。测试还覆盖 `rules` 批准规则对整条命令的匹配、决策日志的并发写入，并通过真实套接字完成 HTTP 接口的端到端测试。
 
-## What this is not
+## 它不是什么
 
 这是一个**审批关卡**，不是沙箱。判定器可能出错；命令经过审查，只代表判定器认为它足够安全、可以免于人工确认，并不等于已经证明它安全。底层仍须保留硬性拦截、允许列表和 agent 自身的权限模型。审查提示词的信任边界也必须保持完整：操作员规则来自系统消息，命令文本则不可信。对于可能产生重大影响的操作，应将 `ESCALATE` 视为正常结果。
 
